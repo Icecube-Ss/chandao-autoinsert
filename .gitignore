@@ -1,0 +1,32 @@
+# 凭据：绝不入库
+secret.local.json
+secret*.json
+!assets/*.json
+
+# 本机环境的确认快照（含内网地址 / 产品 ID / 指派人，属环境信息）
+zentao_sync.config.json
+
+# 写入留痕（含禅道单号与缺陷标题，按需保留）
+.push/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地缺陷输入（报告衍生的真实缺陷数据，含内部接口路径 / 业务术语 / 真实单号）
+# 只保留可公开的模板，其余一律不入库
+defects/*
+!defects/.gitkeep
+
+# 报告原件（含内部系统细节）
+*.local.json
+*.local.html

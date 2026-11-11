@@ -1,0 +1,24 @@
+{
+  "_说明": "示例配置，请勿直接使用。base_url / product_id / assignee 必须替换为你自己的环境——先跑 `meta --json` 检索真实枚举，再与用户确认后覆盖本文件。口令不写这里，另用 secret.local.json 或环境变量 ZENTAO_ACCOUNT / ZENTAO_PASSWORD。",
+  "_字段说明": {
+    "base_url": "禅道地址，结尾不带 /api.php，如 http://zentao.example.com",
+    "product_id": "目标产品 ID，取自 meta 的 products[].id，不要猜",
+    "assignee": "指派人账号，取自 meta 的 users[].account",
+    "opened_build": "构建 ID，传字符串，多数实例为 \"1\"",
+    "default_type": "缺陷类型，取自 meta 的 enums.type（常见 codeerror / performance / designdefect / others）",
+    "severity_map / pri_map": "缺陷等级 → 禅道 sev/pri 的映射，按团队口径改",
+    "agent_short": "必填：实际执行者的短署名（由用户确认，例如 ABC）。启动前须与用户确认；留空会回退 AGENT",
+    "sync_log": "写入留痕路径，相对当前工作目录",
+    "confirmed": "置 true 才允许 apply 真实写入；换环境必须改回 false 重新确认"
+  },
+  "base_url": "",
+  "product_id": 0,
+  "assignee": "",
+  "opened_build": "1",
+  "default_type": "codeerror",
+  "severity_map": { "P0": 1, "P1": 2, "P2": 3, "P3": 4, "P4": 4 },
+  "pri_map": { "P0": 1, "P1": 2, "P2": 3, "P3": 4, "P4": 4 },
+  "agent_short": "",
+  "sync_log": ".push/sync.jsonl",
+  "confirmed": false
+}

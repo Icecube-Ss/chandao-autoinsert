@@ -1,0 +1,31 @@
+{
+  "_说明": "缺陷输入模板。复制出去改名后填写，不要直接改这个文件。字段说明见 references/defect-schema.md。注意：指派人/构建/类型/等级映射不在这里，它们由 meta 检索 + 用户交互确认后写入 zentao_sync.config.json。",
+  "source_report": "Test_Case/<YYYYMMDD>/<报告文件名>.HTML",
+  "report_url": "<报告的可访问链接>",
+  "defects": [
+    {
+      "id": "D-DEMO-01",
+      "lv": "P0",
+      "ep": "EP-01",
+      "title": "一句话说清现象，带接口路径或页面位置",
+      "case": "对应用例编号",
+      "ev": "接口 + 入参 + 次数 + 实际返回（能照着复现的最小信息集）",
+      "actual": "实测结果",
+      "expect": "契约要求的返回码/字段/状态",
+      "fx": "影响面：阻断哪条链路、谁会踩到",
+      "sug": "修复建议，指到文件或方法"
+    },
+    {
+      "id": "D-DEMO-02",
+      "lv": "P1",
+      "ep": "EP-02",
+      "title": "第二条缺陷",
+      "case": "CASE-02",
+      "ev": "……",
+      "actual": "……",
+      "expect": "……",
+      "fx": "……",
+      "sug": "……"
+    }
+  ]
+}
