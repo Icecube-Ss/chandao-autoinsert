@@ -1,4 +1,4 @@
-# 禅道 REST API v1 · 实测契约（2026-11-10 验证）
+# 禅道 REST API v1 · 实测契约
 
 实测环境：`http://<zentao-host>:<port>`（ZenTao 开源版，接口前缀 `/api.php/v1`，主机名已脱敏）。
 以下每条都是实测结论，不是文档抄录；「未验证」项已明确标注。
@@ -25,8 +25,17 @@ token 有效期以服务端配置为准，脚本每次运行重新登录，不�
 
 | 用途 | 请求 | 说明 |
 |---|---|---|
-| 产品缺陷列表 | `GET /products/{id}/bugs?limit=1000` | 返回 `{"page","total","limit","bugs":[...]}` |
+| 产品缺陷列表（查重基线） | `GET /products/{id}/bugs?limit=1000&status=all` | 返回 `{"page","total","limit","bugs":[...]}`；**必须带 `status=all`**，见下方口径说明 |
 | 单条详情 | `GET /bugs/{id}` | 200 返回完整对象 |
+
+**🔴 列表默认排除 `closed`（实测，影响所有查重）**：不带 `status` 时该接口**只返回未关闭单**
+（同一产品同一时刻：默认口径的条数**显著少于** `&status=all`，差额部分经 `GET /bugs/{id}` 逐条核实
+全部 `status=closed`、`deleted=false`，是**过滤不是删除**）。`status=closed` 返回 0（该值不被识别）；
+`type=all` / `status=unclosed` / `deleted=0` 均无效，**只有 `status=all` 生效**。
+沿用默认口径 → 查重基线漏掉已关闭单 → **同一缺陷重复建单**、`verify` 误报「缺失」。
+本技能 `Zentao.bugs(product_id, limit=1000, status="all")` **已默认全状态**，需旧口径时显式传 `status=""`。
+**同一列表接口加不加 `status`，返回字段形态完全一致**（两种口径的交集逐字段比对差异为 0），故三级索引无需改；
+但**不得跨接口比指纹**：列表 `openedBuild` 是名称字符串、单条是对象数组，单条还会把 `steps` 里的裸 URL 自动转链接。
 
 **`?keyword=` 不生效**——实测带 `keyword` 参数仍返回该产品全量缺陷，`total` 与不带参数时一致。
 **查重必须在客户端做**：脚本拉全量后建三级索引（`[SRC:]` 标记 / 标题原文 / 归一化标题）。
@@ -81,7 +90,7 @@ PUT /bugs/{id}
 | 接口 | 结果 | 影响 |
 |---|---|---|
 | `GET /products/{id}/modules` | 404 | 缺陷无法按模块归类，`module` 只能 0 |
-| `GET /products/{id}/builds` | 404 | 构建枚举只能从现有缺陷 `openedBuild` 反推（该产品得到 2 个构建名；其中仅默认构建 id=1 已知） |
+| `GET /products/{id}/builds` | 404 | 构建枚举只能从现有缺陷 `openedBuild` 反推（只能拿到用过的几个构建名，通常仅默认构建 id=1 已知） |
 | `GET /products/{id}/executions` | 404 | 无法关联执行/迭代，`execution` 只能 0 |
 | `GET /projects` | 200 但 `total=0` | 该实例没建项目，`project` 写 0 |
 | `GET /bugs/{id}/comments` | 404 | 见上 |
@@ -111,7 +120,7 @@ PUT /bugs/{id}
 | `severity` / `pri` | 现有缺陷取值分布 | **反推**：接口无枚举端点，但 1–4 全档都被用过，取值域确定 |
 | `type` | 现有缺陷取值分布 | **反推**：该实例只出现过 4 个取值，官方全量枚举未知 |
 | `status` | 现有缺陷取值分布 | **反推**：`active` / `resolved` 等 |
-| 构建 `openedBuild` | 现有缺陷 `openedBuild` 反推 | **反推**：`/builds` 404，只能从已用过的构建名聚合；该实例得到 2 个构建名，id 仅默认构建=1 已知 |
+| 构建 `openedBuild` | 现有缺陷 `openedBuild` 反推 | **反推**：`/builds` 404，只能从已用过的构建名聚合；通常仅默认构建 id=1 确定，其余名称不可靠 |
 
 > 反推值的可信度低于直接枚举：换实例、或该产品缺陷太少时，反推出的枚举可能不全。
 > 所以交互确认时要把「这是从现有缺陷反推的，共 N 个」讲给用户，不能包装成「系统枚举」。

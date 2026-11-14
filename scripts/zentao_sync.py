@@ -16,6 +16,10 @@ import urllib.error
 import urllib.request
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS_DIR = os.path.join(SKILL_DIR, "scripts")
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+import shot_rules  # 截图 / 证据必须直接内嵌（规则 32 门禁）
 DEFAULT_CONFIG = {
     "base_url": "",
     "product_id": 0,
@@ -187,8 +191,17 @@ class Zentao(object):
             self.login()
         return http_json(self.base + path, token=self.token)
 
-    def bugs(self, product_id, limit=1000):
-        st, r = self.get("/api.php/v1/products/%s/bugs?limit=%d" % (product_id, limit))
+    def bugs(self, product_id, limit=1000, status="all"):
+        """产品缺陷列表 = 查重基线，**默认全状态口径 `status=all`**（2026-11-13 用户确认修）。
+
+        禅道 `GET /products/{id}/bugs` **不带 `status` 时默认排除 `closed`**（实测：默认 89 条 /
+        `status=all` 120 条，隐藏的 31 条逐条核实全部 `closed` 且 `deleted=false`，不是删除）。
+        沿用默认口径会让查重基线漏掉已关闭单 → **同一缺陷重复建单**、`verify` 误报「缺失」。
+        同一接口加不加该参数**返回字段形态完全一致**，故 `existing_index` / `normalize` 无需改。
+        需要旧口径（只看未关闭单）时显式传 `status=""`。
+        """
+        q = "?limit=%d" % limit + ("&status=%s" % status if status else "")
+        st, r = self.get("/api.php/v1/products/%s/bugs%s" % (product_id, q))
         if st != 200:
             raise SystemExit("拉取缺陷列表失败：HTTP %s %s" % (st, str(r)[:200]))
         return r.get("bugs", [])
@@ -198,10 +211,28 @@ class Zentao(object):
         return (r if st == 200 and isinstance(r, dict) else None)
 
     def create(self, product_id, payload):
+        # 禅道写入通用准则：新建单恒为 active，不可能满足「已解决」条件 → 硬门禁
+        guard_steps_rules(payload, "active", False)
         return http_json("%s/api.php/v1/products/%s/bugs" % (self.base, product_id),
                          "POST", payload, token=self.token)
 
-    def patch(self, bug_id, payload):
+    def patch(self, bug_id, payload, target_status=None, gate_ok=False, target_type=None):
+        # 禅道写入通用准则：按目标单真实状态 / 真实 type 判定；调用方未传则实时读一次，防止绕过。
+        # 只改 title 的 PUT 同样过门禁：把目标单现有 steps 一并送校验（幂等键 / 截图 / 结论块），
+        # 实际提交仍只带调用方给的字段，不连带改 steps。
+        p = payload or {}
+        if "steps" in p or "title" in p:
+            st, tt = target_status, target_type
+            need_snap = (st is None) or ("title" in p and (tt is None or "steps" not in p))
+            snap = self.bug(bug_id) if need_snap else None
+            if st is None:
+                st = (snap or {}).get("status") or "active"
+            if tt is None:
+                tt = (snap or {}).get("type") or ""
+            check = dict(p)
+            if "title" in p and "steps" not in p:
+                check["steps"] = (snap or {}).get("steps") or ""
+            guard_steps_rules(check, st, gate_ok, tt)
         return http_json("%s/api.php/v1/bugs/%s" % (self.base, bug_id),
                          "PUT", payload, token=self.token)
 
@@ -226,22 +257,181 @@ def esc(s):
 
 
 def normalize(title):
-    """归一化标题用于跨来源比对：剥离格式前缀与任意位置的 [SRC:xxx] 幂等键。
+    """归一化标题用于跨来源比对：剥离格式前缀、任意位置的 [SRC:xxx] 幂等键与【性能】标签。
 
-    同时兼容三代标题：
+    同时兼容四代标题：
       旧版  ``[SRC:x] 问题描述``
       新版  ``[AGENT-Px-X]-问题描述 [SRC:x]``
+      性能版 ``[AGENT-Px-X]-【性能】问题描述 [SRC:x]``（性能类限定）
       纯文本 ``问题描述``
     幂等键改到标题末尾后，旧实现会把它之后的内容全部截掉（返回空串），
     导致 by_bare 索引失效；这里改为「剥离标记」而非「截断到标记之后」。
+    【性能】同样剥离，保证同一缺陷「加标签前 / 后」两种标题在 by_bare 互相命中。
     """
     t = title or ""
     t = re.sub(r"\[SRC:[^\]]*\]", "", t)
     t = re.sub(r"^\s*\[[A-Za-z][A-Za-z0-9]*-P\d-\d+\]-\s*", "", t)
+    t = re.sub(r"^\s*" + re.escape(PERF_TAG) + r"\s*", "", t)
     return " ".join(t.replace("\u3000", " ").split()).lower()
 
 
-def steps_html(d, report_url=""):
+# ───────── 禅道写入通用准则 / 结论块标题（强制）─────────
+# 适用所有禅道写入，详见 SKILL.md「禅道写入准则（通用）」与 references/defect-schema.md。
+# 只有目标单 status=resolved 且三条件证据齐全，才允许把结论块叫「代码级验证结论 · 闭环」；
+# 其余（含新建单，恒 active）一律「【修复建议】」。
+
+CLOSURE_TITLE = "【代码级验证结论 · 闭环】"
+FIX_TITLE = "【修复建议】"
+CLOSURE_TITLE_PAT = re.compile(r"【[^】]*代码级验证结论[^】]*】")
+
+# ───────── 性能类标题限定（强制 · 通用）─────────
+# type=performance 的写入，标题一律 [<Agent缩写>-Px-X]-【性能】问题描述 [SRC:<缺陷号>]；
+# 标签紧贴 ]- 之后、置于问题描述之前，三段前缀与末尾幂等键一字不改；非性能类不得加。
+# 若下游分支保留同源副本，请以本文件为准并保持两侧口径一致。
+PERF_TAG = "【性能】"
+PERF_TYPE = "performance"
+TITLE_PREFIX_PAT = r"^\[[A-Za-z0-9]+-P[0-3]-[1-4]\]-"
+
+
+def perf_title_reason(title, btype):
+    """规则 28「性能类限定」双向校验：type=performance ↔ 标题前缀后紧跟【性能】。
+
+    返回 None = 合规；返回字符串 = 拒绝原因。
+    btype 取本次写入的真实 type（新建取 payload['type']，只改 title 的 PUT 由调用方
+    读回目标单 type 传入）；btype 为空/未知时只校验标签形态，不做双向判定，
+    以免误伤纯 steps 回填等拿不到 type 的历史调用。
+    """
+    t = str(btype or "").strip().lower()
+    has = PERF_TAG in (title or "")
+    at = bool(re.match(TITLE_PREFIX_PAT + re.escape(PERF_TAG), title or ""))
+    if t == PERF_TYPE:
+        if not has:
+            return ("性能类（type=performance）标题缺少【性能】标签，须为 "
+                    "[<Agent缩写>-Px-X]-【性能】问题描述 [SRC:<缺陷号>]（规则 28 性能类限定）")
+        if not at:
+            return ("【性能】标签位置错误：必须紧贴 ]- 之后、置于问题描述之前，"
+                    "不得移到末尾或写进 [SRC:]（规则 28 性能类限定）")
+    elif t:
+        if has:
+            return "非性能类（type=%s）标题不得带【性能】标签（规则 28 性能类限定）" % t
+    elif has and not at:
+        return "【性能】标签位置错误：必须紧贴 ]- 之后（规则 28 性能类限定）"
+    return None
+
+
+def fit_title(title, limit=200):
+    """标题长度上限 200：超限时只截问题描述，**保住末尾幂等键 [SRC:]**（规则 28 不得删除）。"""
+    if len(title) <= limit:
+        return title
+    m = re.search(r"\s*\[SRC:[^\]]*\]\s*$", title)
+    if not m:
+        return title[:limit]
+    key = title[m.start():]
+    return title[:limit - len(key)].rstrip() + key
+
+
+def closure_gate_ok(d):
+    """三条件全成立且证据齐全才返回 True：
+    ① 回归测试已执行 ② 根因对应已修复 ③ 状态与解决方案已实际变更为已解决。
+    resolve_verified 只能在 resolve 成功并回读 status=resolved 之后填 True，
+    「打算改状态」不算。缺省 / 缺字段 / 缺证据 → False → 降级为「【修复建议】」。
+    """
+    g = d.get("closure_gate") or {}
+    if not isinstance(g, dict):
+        return False
+    flags = (g.get("regression_executed") is True
+             and g.get("root_cause_fixed") is True
+             and g.get("resolve_bug") is True
+             and g.get("resolve_verified") is True)
+    evid = all(str(g.get(k) or "").strip() for k in
+               ("regression_evidence", "fix_evidence", "resolution"))
+    return bool(flags and evid)
+
+
+def closure_allowed(d, target_status="active"):
+    """双闸门：目标单真实状态 + 三条件证据。新建单 target_status='active' → 恒 False。"""
+    return str(target_status or "") == "resolved" and closure_gate_ok(d)
+
+
+def conclusion_title(d, target_status="active"):
+    return CLOSURE_TITLE if closure_allowed(d, target_status) else FIX_TITLE
+
+
+def conclusion_html(d, target_status="active"):
+    """结论块富文本；标题按目标状态 + gate 条件化，正文不受影响。"""
+    c = d.get("closure") or d.get("conclusion")
+    if not c:
+        return ""
+    audit = ""
+    if closure_allowed(d, target_status):
+        g = d["closure_gate"]
+        audit = ("<p>闭环口径：回归已执行（%s）；根因已修复（%s）；"
+                 "本单状态与解决方案已变更为已解决（%s）。</p>"
+                 % (html.escape(str(g["regression_evidence"])),
+                    html.escape(str(g["fix_evidence"])),
+                    html.escape(str(g["resolution"]))))
+    if isinstance(c, list):
+        body = "<ol>%s</ol>" % "".join("<li>%s</li>" % html.escape(str(x)) for x in c)
+    else:
+        body = "<p>%s</p>" % html.escape(str(c))
+    return "<p><b>%s</b></p>%s%s" % (conclusion_title(d, target_status), audit, body)
+
+
+def guard_steps_rules(payload, target_status, gate_ok=False, target_type=None):
+    """所有禅道写入的底层门禁（规则 28 标题格式 + 性能类限定 / 规则 30 结论块双闸门 / 规则 32 截图证据内嵌）。
+
+    - 规则 28：带 title 的写入必须符合 `[<Agent缩写>-Px-X]-问题描述 [SRC:x]`，
+      `[SRC:]` 固定末尾且 steps 首部保留同一份；**type=performance 必须带【性能】标签，
+      非性能类不得带**（2026-11-13 性能类限定，双向拒绝）。
+    - 规则 30：steps 含「【…代码级验证结论…】」而目标单不是 resolved、
+      或三条件证据不齐 → 直接拒绝写入。
+    - 规则 32：steps 含「详见知识库报告大图 / 证据已截断」等跳转措辞，
+      或出现「截图」表头却没内嵌真图 → 直接拒绝写入。
+    target_type：只改 title 的 PUT 必须传目标单真实 type（payload 里没有 type），
+    否则性能类双向判定无从做起；未传时只校验标签形态。
+    不静默改文案：让调用方修产出，而不是让脚本替它猜。
+    """
+    payload = payload or {}
+    steps = payload.get("steps") or ""
+    title = (payload.get("title") or "").strip()
+    shot_reason = shot_rules.check_screenshot_rules(steps)
+    if shot_reason:
+        raise SystemExit(
+            "拒绝写入：%s。\n"
+            "禅道写入通用准则 · 规则 32：截图区域必须直接内嵌原始图片，"
+            "运行时证据必须完整；不得用「详见知识库报告大图」「完整证据见知识库报告」"
+            "「证据已截断」等措辞把开发推到知识库。"
+            % shot_reason)
+    if title:
+        if not re.match(TITLE_PREFIX_PAT, title):
+            raise SystemExit(
+                "拒绝写入：标题未按规则 28 生成 `[<Agent缩写>-Px-X]-问题描述 [SRC:<缺陷号>]`：%s\n"
+                "标题由 build_payload() → title_text() 统一生成，不要手工拼。" % title)
+        if "[SRC:" not in title:
+            raise SystemExit("拒绝写入：标题缺少末尾幂等键 [SRC:<缺陷号>]（规则 28）：%s" % title)
+        src = title.rsplit("[SRC:", 1)[-1].strip().rstrip("]").strip()
+        if not src:
+            raise SystemExit("拒绝写入：幂等键 [SRC:] 内容为空（规则 28）：%s" % title)
+        if ("[SRC:%s]" % src) not in steps:
+            raise SystemExit(
+                "拒绝写入：steps 缺少同一幂等键 [SRC:%s]（规则 28：steps 首部必须保留）。\n"
+                "只改 title 的 PUT 请把目标单现有 steps 一并传入门禁校验，实际提交仍只带 title。" % src)
+        perf_reason = perf_title_reason(title, payload.get("type") or target_type)
+        if perf_reason:
+            raise SystemExit("拒绝写入：%s\n当前标题：%s" % (perf_reason, title))
+    m = CLOSURE_TITLE_PAT.search(steps)
+    if m and not (str(target_status or "") == "resolved" and gate_ok is True):
+        raise SystemExit(
+            "拒绝写入：steps 含「%s」，但目标单 status=%s、三条件证据 gate_ok=%s。\n"
+            "禅道写入通用准则：只有「① 回归测试已执行 ② 根因对应已修复 "
+            "③ 状态与解决方案已实际变更为已解决」三条同时成立，才允许闭环标题；\n"
+            "其余一律用「%s」。新建单恒为 active，不允许写入闭环标题"
+            "（即使在 defects 里伪造 closure_gate 也不放行）。"
+            % (m.group(0), target_status, gate_ok, FIX_TITLE))
+    return payload
+
+
+def steps_html(d, report_url="", target_status="active"):
     """缺陷四要素 → 禅道 steps（HTML）。报告链接先转义再包标签，否则会二次转义成乱码。"""
     parts = ["<p>[SRC:%s] %s · %s</p>" % (esc(d.get("id")), esc(d.get("lv")), esc(d.get("ep") or ""))]
     if report_url:
@@ -261,6 +451,10 @@ def steps_html(d, report_url=""):
     ):
         if val:
             parts.append("<p>%s：%s</p>" % (label, esc(val)))
+    ch = conclusion_html(d, target_status)
+    if ch.strip():
+        parts.append("<hr />")
+        parts.append(ch)
     return "".join(parts)
 
 
@@ -273,8 +467,18 @@ TITLE_LV = {"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3", "P4": "P3",
             "1": "P0", "2": "P1", "3": "P2", "4": "P3"}
 
 
+def defect_type(d, cfg):
+    """本次写入的真实 type：缺陷自带 d['type'] > cfg['default_type'] > codeerror。
+
+    标题的【性能】标签与 payload['type'] 必须取同一个值，否则会出现
+    「带标签但 type 不是 performance」被门禁拒（规则 28 性能类限定）。
+    """
+    return str(d.get("type") or cfg.get("default_type", "codeerror")).strip().lower()
+
+
 def title_text(d, cfg):
     """统一标题格式：[<Agent缩写>-Px-X]-问题描述 [SRC:<缺陷号>]
+    性能类（type=performance）：[<Agent缩写>-Px-X]-【性能】问题描述 [SRC:<缺陷号>]
 
     Px = 严重程度（severity 1/2/3/4 → P0/P1/P2/P3）；X = 优先级 pri 原值（不带 P）。
     agent_short 由配置给出（例如 ABC），缺省回退 AGENT，不写完整署名。
@@ -284,7 +488,10 @@ def title_text(d, cfg):
     px = TITLE_LV.get(lv, "P2")
     x = cfg.get("pri_map", {}).get(lv, 3)
     short = str(cfg.get("agent_short") or d.get("agent_short") or "AGENT").strip()
-    return ("[%s-%s-%s]-%s %s" % (short, px, x, d.get("title", ""), signature(d)))[:200]
+    desc = d.get("title", "")
+    if defect_type(d, cfg) == PERF_TYPE and PERF_TAG not in desc:
+        desc = PERF_TAG + desc
+    return fit_title("[%s-%s-%s]-%s %s" % (short, px, x, desc, signature(d)))
 
 
 def build_payload(d, cfg, report_url=""):
@@ -293,7 +500,7 @@ def build_payload(d, cfg, report_url=""):
         "title": title_text(d, cfg),
         "severity": cfg["severity_map"].get(lv, 3),
         "pri": cfg["pri_map"].get(lv, 3),
-        "type": cfg.get("default_type", "codeerror"),
+        "type": defect_type(d, cfg),
         "module": 0,
         "execution": 0,
         "openedBuild": str(cfg.get("opened_build", "1")),
@@ -336,6 +543,17 @@ def verify_bug(d, snap, cfg):
         bad.append("steps 存在二次转义（&lt;a href）")
     if len(snap.get("steps") or "") < 80:
         bad.append("steps 过短（%d 字符），可能有内容丢失" % len(snap.get("steps") or ""))
+    # 禅道写入通用准则：未 resolved 的单不允许带闭环标题（回读侧同样卡一道）
+    if CLOSURE_TITLE_PAT.search(snap.get("steps") or "") and snap.get("status") != "resolved":
+        bad.append("steps 含闭环标题但单未 resolved（违反禅道写入通用准则）")
+    # 规则 32：回读侧复核。禅道会把 base64 图转成 fileID=N 或 {N.png}，三种形态都算真图
+    shot_reason = shot_rules.check_screenshot_rules(snap.get("steps") or "")
+    if shot_reason:
+        bad.append(shot_reason + "（回读）")
+    # 规则 28 性能类限定：回读侧按目标单真实 type 复核【性能】标签（双向）
+    perf_reason = perf_title_reason(snap.get("title") or "", snap.get("type"))
+    if perf_reason:
+        bad.append(perf_reason + "（回读）")
     return bad
 
 
@@ -483,7 +701,7 @@ def do_auth(cfg, sec, sec_src):
 
 def print_meta(m):
     print("禅道 %s · 账号 %s（凭据来源：%s）" % (m["base_url"], m["account"], m["credential_source"]))
-    print("当前产品：%s %s（现有缺陷 %d 条）" % (m["product_id"], m["product_name"], m["bug_count"]))
+    print("当前产品：%s %s（现有缺陷 %d 条 · 全状态含已关闭）" % (m["product_id"], m["product_name"], m["bug_count"]))
     print("\n[产品] " + " / ".join("%s:%s" % (p["id"], p["name"]) for p in m["products"]))
     print("[指派账号] " + " / ".join(u["account"] for u in m["users"]))
     if m["assignee_history"]:
@@ -597,7 +815,7 @@ def main():
     # ── list ──
     if args.cmd == "list":
         bugs = zt.bugs(cfg["product_id"])
-        print("产品 %s 共 %d 条缺陷" % (cfg["product_id"], len(bugs)))
+        print("产品 %s 共 %d 条缺陷（全状态含已关闭）" % (cfg["product_id"], len(bugs)))
         for b in sorted(bugs, key=lambda x: x.get("id", 0)):
             print("%5s | %-8s | sev%s | %s" % (b.get("id"), b.get("status"), b.get("severity"),
                                                (b.get("title") or "")[:88]))
@@ -609,17 +827,19 @@ def main():
 
     # ── patch-steps ──
     if args.cmd == "patch-steps":
-        hit = None
-        for d in defects:
-            st, r = zt.get("/api.php/v1/bugs/%s" % args.bug)
-            snap = r if st == 200 and isinstance(r, dict) else None
-            if snap and ("[SRC:%s]" % d["id"]) in (snap.get("title") or ""):
-                hit = d
-                break
+        st0, snap0 = zt.get("/api.php/v1/bugs/%s" % args.bug)
+        snap = snap0 if st0 == 200 and isinstance(snap0, dict) else None
+        if not snap:
+            sys.exit("读不到单 #%s（HTTP %s），拒绝 patch" % (args.bug, st0))
+        target_status = snap.get("status") or "active"
+        hit = next((d for d in defects
+                    if ("[SRC:%s]" % d["id"]) in (snap.get("title") or "")), None)
         if not hit:
             sys.exit("单 #%s 的标题里找不到匹配的 [SRC:xxx] 标记，无法确定对应哪条缺陷" % args.bug)
-        st, r = zt.patch(args.bug, {"steps": steps_html(hit, report_url)})
-        print("patch #%s ← %s : HTTP %s" % (args.bug, hit["id"], st))
+        new_steps = steps_html(hit, report_url, target_status=target_status)
+        st, r = zt.patch(args.bug, {"steps": new_steps},
+                         target_status=target_status, gate_ok=closure_gate_ok(hit))
+        print("patch #%s ← %s : HTTP %s（目标状态 %s）" % (args.bug, hit["id"], st, target_status))
         bad = verify_bug(hit, zt.bug(args.bug), cfg)
         print("校验：" + ("通过" if not bad else "；".join(bad)))
         return 0 if st == 200 and not bad else 1
@@ -648,7 +868,7 @@ def main():
     # ── plan / apply ──
     bugs = zt.bugs(cfg["product_id"])
     by_title, by_bare, by_src = existing_index(bugs)
-    print("登录 %s @ %s；产品 %s 现有缺陷 %d 条（查重基线）"
+    print("登录 %s @ %s；产品 %s 现有缺陷 %d 条（查重基线 · 全状态含已关闭）"
           % (sec["account"], cfg["base_url"], cfg["product_id"], len(bugs)))
 
     todo, skip = [], []
@@ -690,6 +910,8 @@ def main():
         print("--- %s %s  sev%s/pri%s  → %s" % (d["id"], d.get("lv"), p["severity"], p["pri"],
                                                 p["assignedTo"] or "(不指派)"))
         print("    %s" % p["title"])
+        print("    写入准则: target_status=active（新建）· 结论块标题=%s · create 门禁已启用"
+              % conclusion_title(d, "active"))
         if not write:
             print("    [dry-run] 未提交，steps %d 字符" % len(p["steps"]))
             results.append({"id": d["id"], "status": "dry-run"})
