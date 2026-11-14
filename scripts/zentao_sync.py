@@ -100,6 +100,47 @@ def resolve_config(cli_path):
     return cfg
 
 
+TRACKED_CONFIG = os.path.join(SKILL_DIR, "config.json")
+
+
+def guard_config_target(path):
+    """禁止把真实环境配置写进被 Git 跟踪的 config.json。
+
+    config.json 是仓库里的示例配置，**受版本控制**；
+    .gitignore 只能拦 `zentao_sync.config.json`（带前缀），拦不住已跟踪文件。
+    若有人图省事直接改它，一次 `git commit -a` 就会把内网地址、指派人账号推上远端。
+    故写入边界由代码守住：技能目录内的 config.json 只读，配置一律另存为带前缀的文件。
+    """
+    if not path:
+        return path
+    try:
+        same = os.path.normcase(os.path.realpath(path)) == \
+            os.path.normcase(os.path.realpath(TRACKED_CONFIG))
+    except Exception:
+        same = False
+    if same:
+        sys.exit(
+            "已拒绝写入 %s：该文件是仓库内的示例配置，受 Git 跟踪，"
+            "写入后一旦提交就会把内网地址与账号推到远端。\n"
+            "请改用：当前工作目录下的 zentao_sync.config.json（已在 .gitignore 中），"
+            "或用 --config 显式指定一个仓库外的路径。\n"
+            "示例：  --config ~/zentao/zentao_sync.config.json" % path)
+    return path
+
+
+def secure_config_hint(current_path):
+    """提示当前配置来源是否安全（只用于 meta/auth 的输出，不阻断）。"""
+    try:
+        if current_path and os.path.normcase(os.path.realpath(current_path)) == \
+                os.path.normcase(os.path.realpath(TRACKED_CONFIG)):
+            return ("warning_tracked_config",
+                    "当前读的是仓库内示例配置 config.json。若你把真实地址写在这里，"
+                    "提交时会泄露内网信息；请改写到 zentao_sync.config.json 或 --config 指向的仓库外路径。")
+    except Exception:
+        pass
+    return None, None
+
+
 MISSING_SECRET = ("缺少禅道凭据：请向用户索取登录授权后再执行，不要擅自复用历史凭据文件。\n"
                   "三种给法任选：① 用户提供账号口令后写入 secret.local.json（{\"account\":\"...\",\"password\":\"...\"}）；"
                   "② 环境变量 ZENTAO_ACCOUNT / ZENTAO_PASSWORD；③ --secret 指向已有文件。\n"
@@ -126,6 +167,151 @@ def resolve_secret(cli_path, required=True):
             sys.exit(MISSING_SECRET)
         return None, None
     return sec, src
+
+
+# ────────────────────────── 传输风险（明文 HTTP）──────────────────────────
+#
+# 本工具登录时以明文发送账号口令（POST /api.php/v1/tokens），随后所有请求带明文
+# Token。HTTP 下这两样都在网络层裸奔：同广播域的主动 ARP 欺骗、恶意 AP、端口镜像
+# 都能截获，攻击者拿到口令即可冒用身份。HTTPS 则有 TLS 保护，风险显著降低。
+#
+# 因此按「传输强度 + 网络位置」分四级，写操作前必须拿到用户对该等级的显式确认：
+#   https        —— 有 TLS，无需确认
+#   回环/本机     —— 流量不出主机，无需确认
+#   私网 http     —— 可控办公网内可接受，但需确认一次（提醒不要在不可信网络跑）
+#   公网 http     —— 高危，需确认，且确认语明确劝阻
+#
+# 确认方式（二者其一，均需显式动作，不做静默放行）：
+#   --accept-http-risk      本次命令放行
+#   ZENTAO_SYNC_ACCEPT_HTTP_RISK=1   显式接受（建议仅在本机 shell 会话内 export）
+
+RISK_LEVELS = {
+    "https": {"level": "none", "need_confirm": False},
+    "loopback": {"level": "low", "need_confirm": False},
+    "private_http": {"level": "medium", "need_confirm": True},
+    "public_http": {"level": "high", "need_confirm": True},
+}
+
+ACCEPT_RISK_ENV = "ZENTAO_SYNC_ACCEPT_HTTP_RISK"
+
+
+def _is_loopback(host):
+    h = (host or "").strip().lower().strip("[]")
+    if h in ("localhost", "::1", "0.0.0.0"):
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(h).is_loopback
+    except Exception:
+        return False
+
+
+def _is_private(host):
+    """私网 / 链路本地 / 唯一本地地址判定；域名一律按 public 处理（保守）。"""
+    h = (host or "").strip().lower().strip("[]")
+    if h.endswith(".local") or h.endswith(".lan") or h.endswith(".internal"):
+        return True
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(h)
+        return ip.is_private or ip.is_link_local
+    except Exception:
+        return False
+
+
+def transport_risk(base_url):
+    """判定与禅道交互的传输风险等级。
+
+    返回 dict：level / need_confirm / scheme / host_class / reason / advice
+    host_class 只输出「回环 / 私网 / 公网」这类分类，不回显真实主机名或 IP，
+    避免把内网地址写进日志、报告或对话记录。
+    """
+    u = (base_url or "").strip()
+    scheme = (u.split("://", 1)[0].lower() if "://" in u else "")
+    host = ""
+    if "://" in u:
+        rest = u.split("://", 1)[1]
+        host = rest.split("/", 1)[0]
+        if "@" in host:                      # 去掉 userinfo
+            host = host.rsplit("@", 1)[1]
+        if host.startswith("["):             # IPv6 字面量
+            host = host[1:].split("]", 1)[0]
+        elif ":" in host:                    # 去端口
+            host = host.rsplit(":", 1)[0]
+
+    if scheme == "https":
+        info = dict(RISK_LEVELS["https"])
+        info.update(scheme="https", host_class="不适用", reason="已启用 TLS，链路加密。", advice="")
+        return info
+
+    if scheme != "http":
+        info = dict(RISK_LEVELS["public_http"])
+        info.update(scheme=scheme or "未知", host_class="未知",
+                    reason="无法识别协议（%s），按最高风险处理。" % (scheme or "空"),
+                    advice="请确认 base_url 形如 http://host:port/ 或 https://host/")
+        return info
+
+    if _is_loopback(host):
+        info = dict(RISK_LEVELS["loopback"])
+        info.update(scheme="http", host_class="回环/本机",
+                    reason="目标为本机回环地址，流量不出主机，明文无外部暴露面。", advice="")
+        return info
+
+    if _is_private(host):
+        info = dict(RISK_LEVELS["private_http"])
+        info.update(scheme="http", host_class="私网",
+                    reason="以明文 HTTP 与私网禅道交互：登录口令与 Token 在网络上可被截获。"
+                           "同广播域的主动 ARP 欺骗、恶意接入点或端口镜像都可利用；"
+                           "被动嗅探在现代交换网络下通常听不到他人单播流量。",
+                    advice="可控的办公网内可接受；不要在访客 Wi-Fi、公共网络或不可信网段运行。"
+                           "条件允许时改用 https 并导入内部 CA。")
+        return info
+
+    info = dict(RISK_LEVELS["public_http"])
+    info.update(scheme="http", host_class="公网",
+                reason="以明文 HTTP 与公网可达的禅道交互：口令与 Token 会经过路径上每一跳，"
+                       "存在被截获与被冒充的双重风险。此类暴露面通常数小时内即被全网扫描到。",
+                advice="强烈建议改用 https（受信 CA 或内部 CA）。不要为绕过证书错误而关闭校验。")
+    return info
+
+
+def risk_accepted(args=None):
+    """用户是否已显式接受本次明文传输风险。"""
+    if args is not None and getattr(args, "accept_http_risk", False):
+        return True
+    return os.environ.get(ACCEPT_RISK_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def http_risk_prompt(risk):
+    """生成给人看 / 给 Agent 转述的确认文案。"""
+    lvl = risk.get("level")
+    if lvl == "high":
+        head = "⚠️ 高危：当前与禅道的连接是明文 HTTP，且目标是公网可达地址。"
+    else:
+        head = "注意：当前与禅道的连接是明文 HTTP（无 TLS 加密）。"
+    return (
+        "%s\n"
+        "  目标类型：%s（%s）\n"
+        "  风险说明：%s\n"
+        "  规避建议：%s\n"
+        "  若确认继续，请显式加 --accept-http-risk（仅本次生效），"
+        "或在可信会话内 export %s=1。"
+        % (head, risk.get("host_class"), risk.get("scheme"),
+           risk.get("reason"), risk.get("advice"), ACCEPT_RISK_ENV)
+    )
+
+
+def require_transport_ack(risk, args, action="写入"):
+    """写操作前的强制闸门：明文传输且用户未显式确认时拒绝执行。
+
+    https / 回环直接放行；私网与公网 http 必须由调用方拿到显式确认后放行。
+    """
+    if not risk.get("need_confirm"):
+        return True
+    if risk_accepted(args):
+        return True
+    sys.exit("已拒绝%s：%s\n\n%s"
+             % (action, "明文 HTTP 传输未获确认", http_risk_prompt(risk)))
 
 
 # ────────────────────────── HTTP ──────────────────────────
@@ -736,6 +922,8 @@ def add_common(p, suppress=False):
     p.add_argument("--secret", help="凭据文件路径", **kw)
     p.add_argument("--product", type=int, help="覆盖产品 ID", **kw)
     p.add_argument("--assignee", help="覆盖指派人账号", **kw)
+    p.add_argument("--accept-http-risk", action="store_true", dest="accept_http_risk",
+                   help="确认接受明文 HTTP 传输风险（仅本次命令生效）", **kw)
     return p
 
 
@@ -776,28 +964,51 @@ def main():
         sys.exit("配置缺 base_url。当前读到的是示例配置（%s），里面的地址是占位值。\n"
                  "请在当前工作目录新建 zentao_sync.config.json 并填写 base_url"
                  "（结尾不带 /api.php，如 http://zentao.example.com），或用 --config 指定文件。\n"
-                 "配好后依次跑：auth 核验授权 → meta 检索字段枚举 → 与用户确认。"
+                 "注意：不要修改技能目录里的 config.json——它受 Git 跟踪，写了真实地址会被提交泄露。\n"
+                 "配好后依次跑：auth 核验授权（含明文传输风险提示）→ meta 检索字段枚举 → 与用户确认。"
                  % cfg.get("_from", "内置默认"))
+
+    # 被 Git 跟踪的 config.json 里出现真实地址 = 即将泄露内网信息，直接阻断
+    _warn, _msg = secure_config_hint(cfg.get("_from"))
+    if _warn == "warning_tracked_config":
+        sys.exit("已阻断：%s\n当前读到 base_url 的来源是 %s。"
+                 % (_msg, cfg.get("_from")))
 
     # ── auth：无凭据也要能跑，用来告诉调用方「该向用户索取授权了」──
     if args.cmd == "auth":
+        risk = transport_risk(cfg.get("base_url"))
         sec, src = resolve_secret(getattr(args, "secret", None), required=False)
         if not sec:
             if args.json:
-                print(json.dumps({"ok": False, "error": "missing_credential", "hint": MISSING_SECRET},
+                print(json.dumps({"ok": False, "error": "missing_credential",
+                                  "hint": MISSING_SECRET, "risk": risk,
+                                  "risk_accepted": risk_accepted(args)},
                                  ensure_ascii=False, indent=2))
             else:
                 print(MISSING_SECRET)
+                if risk.get("need_confirm"):
+                    print("\n" + http_risk_prompt(risk))
             return 2
         out, _ = do_auth(cfg, sec, src)
+        # 传输风险随 auth 一并返回：交互层据此在「索取凭据」之前就能提示用户
+        out["risk"] = risk
+        out["risk_accepted"] = risk_accepted(args)
         if args.json:
             print(json.dumps(out, ensure_ascii=False, indent=2))
         else:
             print_auth(out)
+            if risk.get("need_confirm") and not risk_accepted(args):
+                print("\n" + http_risk_prompt(risk))
         return 0 if out.get("ok") else 2
 
     if not cfg.get("product_id"):
         sys.exit("配置缺 product_id：用 --config 指定，或先跑 meta 看产品列表后写入配置")
+
+    risk = transport_risk(cfg.get("base_url"))
+
+    # 写操作前必须先拿到明文传输的显式确认（https / 回环自动放行）
+    if args.cmd in ("apply", "patch-steps"):
+        require_transport_ack(risk, args, action="写入禅道")
 
     sec, sec_src = resolve_secret(getattr(args, "secret", None))
     zt = Zentao(cfg["base_url"], sec["account"], sec["password"])

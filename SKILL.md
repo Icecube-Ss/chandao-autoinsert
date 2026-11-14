@@ -9,6 +9,7 @@ agent_created: true
 
 > **一句话**：读报告 → 问授权 → 拉枚举 → 确认字段 → 演练 → 单条试写 → 批量 → 回读。
 > **三个不可跳的检查点**：`auth` 没通过不写、`meta` 没确认不写、首次写入不单条不批量。
+> **明文传输另有一道硬门**：`http` 且非回环地址时，写操作前必须先拿到用户对传输风险的显式确认（见「门一之二」）。
 > **依赖**：Python 3.7+，纯标准库（无 pip 安装），Windows / macOS / Linux 通用。
 
 把「测试报告里的缺陷条目」变成「禅道里可指派、可跟踪的 Bug 单」。
@@ -69,6 +70,64 @@ python $S auth --json      # 先探，不写任何数据
 
 **口令红线**：不写进 `config.json`、不写进 defects JSON、不写进报告正文、不写进任何上传云端或在群里发送的内容。
 用户若在对话里贴了口令，收尾时提醒一句「口令已用于本次登录，建议尽快更换」。
+
+### 门一之二 · 传输风险确认：明文 HTTP 必须先讲清、再拿确认
+
+**为什么单独设一道门**：本工具登录时以明文发送账号口令（`POST /api.php/v1/tokens`），
+之后所有请求带明文 `Token`。走 HTTP 时这两样在网络层都是裸奔的——同广播域的**主动 ARP 欺骗**、
+恶意接入点、端口镜像都能截获；攻击者拿到口令即可冒用身份，拿到 Token 可冒充操作。
+HTTPS 有 TLS 保护，风险显著降低。**这不只是提醒文案，是写操作前的硬门禁。**
+
+`auth --json` 的返回里已带 `risk` 块与 `risk_accepted`，**据此判定，不要自己猜协议**：
+
+| `risk.level` | `need_confirm` | 判定依据 | 你必须做什么 |
+|---|---|---|---|
+| `none` | false | `https` | 放行，无需提示 |
+| `low` | false | `http` + 回环/本机地址 | 放行，无需提示（流量不出主机） |
+| `medium` | **true** | `http` + 私网地址 | **先弹风险确认，拿到用户明确同意再继续** |
+| `high` | **true** | `http` + 公网地址 | **先弹风险确认并明确劝阻**，用户坚持才继续 |
+
+**执行顺序（不可颠倒）**：
+
+1. 跑 `auth --json`，读出 `risk`。
+2. `need_confirm=true` 时，**在向用户索取口令之前**先用下面的话术确认传输方式。
+   理由：用户一旦输入口令，口令就已经上路了，事后再提示毫无意义。
+3. 用户确认后，写操作才允许带 `--accept-http-risk`（或在可信会话内 `export ZENTAO_SYNC_ACCEPT_HTTP_RISK=1`）。
+4. 用户拒绝 → 停下来，给出改进建议（改 https / 导入内部 CA），**不要**擅自绕过。
+
+**确认话术（`medium` 私网场景，按此意复述，不必逐字）**：
+
+> 本次与禅道的连接是**明文 HTTP**，登录口令与 Token 在网络上可被截获。
+> 如果这台机器在当前办公网内、且你不主动把账号告诉别人，这个风险通常可以接受：
+> 现代交换机会按 MAC 表转发，被动嗅探一般听不到他人流量，真正的威胁是同网段的主动 ARP 欺骗。
+> 但请不要在访客 Wi-Fi、公共网络或不可信网段运行。
+> 确认继续吗？（确认后本次以 `--accept-http-risk` 放行）
+
+**`high` 公网场景追加**：明确告知「口令会经过路径上每一跳，且这类暴露面通常数小时内被全网扫描到」，
+并建议改用 https。**不要在公网 http 场景下轻描淡写地说「可以忽略」**——那一档没有可接受性。
+
+**允许「适当忽略」的唯一情形**：`need_confirm=true` 且用户已确认当前处在**可控办公网域**
+（自建内网、无访客接入、不主动外传账号）。此时一次确认即可覆盖本轮操作，不必每条命令重复问；
+但**每次新建会话、或 `base_url`/网络环境发生变化时，必须重新确认**。
+
+**红线**：
+- 不得用 `ZENTAO_SYNC_INSECURE=1` 或任何方式关闭证书校验来「解决」风险提示——那是把明文风险升级成可被冒充。
+- 不得把 `ZENTAO_SYNC_ACCEPT_HTTP_RISK=1` 长期写进 shell 启动脚本或系统环境变量，导致后续每次调用静默放行。
+- 不得在用户未确认时带 `--accept-http-risk` 强行执行写操作。
+
+### 门一之三 · 配置只能写到仓库外
+
+`config.json` 是仓库内的示例配置，**受 Git 跟踪**；`.gitignore` 只拦 `zentao_sync.config.json`（带前缀的），
+拦不住已跟踪文件。若图省事直接改它，一次 `git commit -a` 就会把内网地址与指派人账号推上远端。
+
+| 正确做法 | 错误做法 |
+|---|---|
+| 当前工作目录下 `zentao_sync.config.json`（已被忽略） | 改技能目录里的 `config.json` |
+| `--config <仓库外路径>` | 把真实地址写进示例配置 |
+| `ZENTAO_SYNC_CONFIG` 指向仓库外文件 | 提交后再 `git checkout` 假装没发生（历史里已经有了） |
+
+脚本已设两道保护：读到被跟踪的 `config.json` 里含真实 `base_url` 时**直接阻断执行**；
+`guard_config_target()` 拒绝写入该路径。**不要试图绕过，改用带前缀的文件名即可。**
 
 ### 门二 · 字段枚举确认：选项只能来自 `meta`，不能凭印象
 
@@ -171,7 +230,8 @@ Q7 是否回填报告    → 选项：回填（需出新版本）/ 不回填（�
 ```bash
 S=<技能目录>/scripts/zentao_sync.py
 
-# 1. 登录授权核验（无凭据时向用户索取，不静默复用）
+# 1. 登录授权核验 + 传输风险探测（无凭据时向用户索取，不静默复用）
+#    返回里的 risk.need_confirm=true 时：先按「门一之二」拿到用户对明文 HTTP 的确认，再往下走
 python $S auth --json
 
 # 2. 字段枚举检索 → 选项式交互确认 → 写入 zentao_sync.config.json（含 confirmed: true）
@@ -187,10 +247,11 @@ python $S list
 python $S plan --defects defects/xxx.json
 
 # 6. 单条试写：只建 1 条，验证字段受理 + 回读校验
-python $S apply --defects defects/xxx.json --limit 1
+#    明文 HTTP 场景需带 --accept-http-risk（用户已确认后）
+python $S apply --defects defects/xxx.json --limit 1 --accept-http-risk
 
 # 7. 批量补齐剩余（查重自动跳过已建的）
-python $S apply --defects defects/xxx.json
+python $S apply --defects defects/xxx.json --accept-http-risk
 
 # 收尾：整体回读校验
 python $S verify --defects defects/xxx.json
@@ -211,9 +272,9 @@ python $S verify --defects defects/xxx.json
 | `meta [--json]` | 字段枚举检索：产品 / 账号 / 构建 / sev / pri / type + 接口缺口 | 否 |
 | `list` | 列现有缺陷 | 否 |
 | `plan --defects F` | 打印将要提交的 payload | 否 |
-| `apply --defects F [--limit N] [--force]` | 创建，写后自动回读校验 | **是** |
+| `apply --defects F [--limit N] [--force] [--accept-http-risk]` | 创建，写后自动回读校验 | **是** |
 | `verify --defects F` | 按 defects 回读校验已建单字段 | 否 |
-| `patch-steps --defects F --bug <单号>` | 用最新渲染逻辑重写某单的 steps | **是** |
+| `patch-steps --defects F --bug <单号> [--accept-http-risk]` | 用最新渲染逻辑重写某单的 steps | **是** |
 
 `--product` / `--assignee` 可临时覆盖配置，但它们**只做临时覆盖**——确认过的值应该写进配置文件，不要靠每次传参。
 

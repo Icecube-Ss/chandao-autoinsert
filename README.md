@@ -23,9 +23,19 @@
 
 ## 亮点：把「该问的」做成脚本拦得住的门槛
 
-这个技能不是 API 封装，它在写库前设了四道硬门：
+这个技能不是 API 封装，它在写库前设了六道硬门：
 
 **门一 · 登录授权**。`auth` 检测凭据来源并核验身份；没凭据就返回 `missing_credential` 并向用户索取，**不会翻别的目录找旧凭据顶替**。凭据存在 ≠ 用户这次同意用这个账号写缺陷。
+
+**门一之二 · 传输风险确认**。`auth --json` 会随凭据状态一并返回 `risk` 块（`level` / `need_confirm` / 主机类型 / 风险说明）。
+`http` 且不是回环地址时 `need_confirm=true`：**写操作前必须先拿到用户对明文传输的显式确认**，
+否则 `apply` / `patch-steps` 直接拒绝执行，须带 `--accept-http-risk`（或临时 `export ZENTAO_SYNC_ACCEPT_HTTP_RISK=1`）。
+私网 http 判定为「可控办公网内可接受」，公网 http 判定为「高危、明确劝阻」——两档话术不同，后者不提供「可忽略」选项。
+`https` 与回环地址自动放行，不打扰。
+
+**门一之三 · 配置只写仓库外**。`config.json` 受 Git 跟踪，`.gitignore` 拦不住已跟踪文件；
+直接改它再 `git commit -a` 会把内网地址与账号推上远端。脚本读到被跟踪配置里含真实 `base_url` 时**直接阻断**，
+`guard_config_target()` 拒绝写入该路径，配置一律用 `zentao_sync.config.json` 或 `--config` 指向仓库外。
 
 **门二 · 字段确认**。`meta` 从禅道实时拉枚举——可见账号、历史接单人及次数、构建、`severity/pri/type` 实际取值分布，以及**哪些枚举接口根本不存在**。选项只能来自这里，不能凭印象。确认结果落成配置并置 `confirmed: true`，**没有这个标记 `apply` 拒绝写入**。
 
@@ -70,7 +80,7 @@ export ZENTAO_ACCOUNT=your-account
 export ZENTAO_PASSWORD=your-password
 # 禅道地址写进当前工作目录的 zentao_sync.config.json，或 --config 指定
 
-# 2. 核验授权（无凭据会提示去要）
+# 2. 核验授权（无凭据会提示去要；返回里带 risk 块，need_confirm 时先向用户确认传输风险）
 python $S auth --json
 
 # 3. 拉真实枚举，据此与用户确认指派人/等级/类型/构建
@@ -82,8 +92,8 @@ python $S list
 # 5. 演练（不发写请求）
 python $S plan --defects defects/my-report.json
 
-# 6. 单条试写，验证契约
-python $S apply --defects defects/my-report.json --limit 1
+# 6. 单条试写，验证契约（明文 HTTP 需先取得用户确认，再加 --accept-http-risk）
+python $S apply --defects defects/my-report.json --limit 1 --accept-http-risk
 
 # 7. 批量补齐（自动跳过已建）
 python $S apply --defects defects/my-report.json
@@ -102,24 +112,28 @@ python $S verify --defects defects/my-report.json
 | `meta [--json]` | 字段枚举检索 + 接口能力探测 | 否 |
 | `list` | 列现有缺陷 | 否 |
 | `plan --defects F` | 打印将要提交的 payload | 否 |
-| `apply --defects F [--limit N] [--force]` | 创建 + 写后自动回读校验 | **是** |
+| `apply --defects F [--limit N] [--force] [--accept-http-risk]` | 创建 + 写后自动回读校验 | **是** |
 | `verify --defects F` | 按缺陷文件回读校验 | 否 |
-| `patch-steps --defects F --bug <单号>` | 用最新渲染逻辑重写某单 steps | **是** |
+| `patch-steps --defects F --bug <单号> [--accept-http-risk]` | 用最新渲染逻辑重写某单 steps | **是** |
 
 ## 兼容性
 
 - Python 3.7+ / Windows、macOS、Linux
 - 终端编码：已强制 UTF-8 输出并切换 Windows 代码页，GBK 与 `LC_ALL=C` 下实测正常
 - 配置文件：UTF-8 带 BOM 也能读（Windows 记事本存的也行）
-- 自签证书：`ZENTAO_SYNC_INSECURE=1` 跳过校验（默认严格校验，不静默弱化）。**该开关会关闭 TLS 证书验证**，
-  仅在完全可信的内网自建实例上临时使用；对公网可达的禅道地址开启此开关会引入中间人风险，且凭据在明文 HTTP 下传输本身即不安全。
+- 自签证书：`ZENTAO_SYNC_INSECURE=1` 跳过校验（默认严格校验，不静默弱化）。**该开关只对 `https` 生效**——
+  `http` 连接没有 TLS 层，设了也不起作用。它**会完全关闭证书验证**（不验证签发者、有效期、域名），
+  仅适合完全可信的内网自建实例临时使用；对公网可达地址开启会引入中间人风险。正解是把内部 CA
+  导入系统信任库，而不是关校验。
+- 明文 HTTP：技能会在 `auth` 阶段返回风险等级，并在写操作前要求显式确认（`--accept-http-risk`）。
+  私网环境属可控风险，公网环境请改用 https。
 - 宿主无选项式提问工具时，按 SKILL.md 的降级方式输出编号列表
 - 禅道版本差异：`references/api-contract.md` 是实测契约，**换实例请先跑 `meta` 重新探测**，别照抄 404 结论
 
 ## 目录结构
 
 ```
-SKILL.md                      流程、四道硬门、七步工作流、禅道写入准则（通用）、宿主差异表
+SKILL.md                      流程、六道硬门、七步工作流、禅道写入准则（通用）、宿主差异表
 config.json                   示例配置（占位值，勿直接用）
 scripts/zentao_sync.py        全部实现，纯标准库
 scripts/shot_rules.py         截图 / 证据内嵌门禁（路径无关，可独立复用）
